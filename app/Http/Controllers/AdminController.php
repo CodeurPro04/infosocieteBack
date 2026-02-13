@@ -2,18 +2,21 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Cancellation;
+use App\Models\Claim;
+use App\Models\Contact;
+use App\Models\KbisRequest;
+use App\Models\Payment;
+use App\Models\UserCustomer;
 use App\Services\ContentStore;
-use App\Services\SubmissionStore;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 
 class AdminController extends Controller
 {
-    public function __construct(
-        private ContentStore $contentStore,
-        private SubmissionStore $submissionStore
-    ) {
+    public function __construct(private ContentStore $contentStore)
+    {
     }
 
     public function login(Request $request)
@@ -54,7 +57,119 @@ class AdminController extends Controller
     public function submissions()
     {
         return response()->json([
-            'submissions' => $this->submissionStore->all(),
+            'submissions' => $this->collectSubmissions(),
         ]);
+    }
+
+    public function submissionsByType(string $type)
+    {
+        $allowed = ['contact', 'cancellation', 'claim', 'signup', 'kbis_request', 'payment'];
+
+        if (!in_array($type, $allowed, true)) {
+            return response()->json(['message' => 'Invalid type'], 422);
+        }
+
+        $items = array_values(array_filter($this->collectSubmissions(), fn ($item) => ($item['type'] ?? '') === $type));
+
+        return response()->json([
+            'submissions' => $items,
+        ]);
+    }
+
+    private function collectSubmissions(): array
+    {
+        $items = [];
+
+        foreach (Contact::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'CON-'.$row->id,
+                'type' => 'contact',
+                'payload' => $row->only(['name', 'email', 'company', 'subject', 'message', 'source_path']),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        foreach (Cancellation::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'RES-'.$row->id,
+                'type' => 'cancellation',
+                'payload' => $row->only(['email', 'source_path']),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        foreach (Claim::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'REC-'.$row->id,
+                'type' => 'claim',
+                'payload' => $row->only(['name', 'email', 'order_ref', 'subject', 'message', 'source_path']),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        foreach (UserCustomer::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'SIGN-'.$row->id,
+                'type' => 'signup',
+                'payload' => $row->only([
+                    'profile',
+                    'siret_or_siren',
+                    'company_name',
+                    'address',
+                    'first_name',
+                    'last_name',
+                    'email',
+                    'phone',
+                ]),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        foreach (KbisRequest::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'KBIS-'.$row->id,
+                'type' => 'kbis_request',
+                'payload' => $row->only([
+                    'siret_or_siren',
+                    'profile',
+                    'company_name',
+                    'address',
+                    'first_name',
+                    'last_name',
+                    'email',
+                    'phone',
+                    'source_path',
+                    'consent',
+                ]),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        foreach (Payment::query()->latest()->get() as $row) {
+            $items[] = [
+                'id' => 'PAY-'.$row->id,
+                'type' => 'payment',
+                'payload' => $row->only([
+                    'stripe_intent_id',
+                    'status',
+                    'amount',
+                    'currency',
+                    'holder_name',
+                    'email',
+                    'siret_or_siren',
+                    'profile',
+                    'company_name',
+                    'address',
+                    'first_name',
+                    'last_name',
+                    'phone',
+                    'source_path',
+                ]),
+                'created_at' => optional($row->created_at)->toDateTimeString(),
+            ];
+        }
+
+        usort($items, fn ($a, $b) => strcmp($b['created_at'] ?? '', $a['created_at'] ?? ''));
+        return $items;
     }
 }

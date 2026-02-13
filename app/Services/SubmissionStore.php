@@ -2,39 +2,50 @@
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\File;
+use App\Models\Submission;
 
 class SubmissionStore
 {
-    private string $path;
-
-    public function __construct()
-    {
-        $this->path = storage_path('app/submissions.json');
-    }
-
     public function append(string $type, array $payload): void
     {
-        $data = $this->all();
-        $data[] = [
+        $id = $payload['id'] ?? $this->generateId($type);
+
+        unset($payload['id']);
+        Submission::create([
+            'submission_id' => $id,
             'type' => $type,
             'payload' => $payload,
-            'created_at' => now()->toDateTimeString(),
-        ];
-
-        File::ensureDirectoryExists(dirname($this->path));
-        File::put($this->path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+        ]);
     }
 
     public function all(): array
     {
-        if (!File::exists($this->path)) {
-            return [];
-        }
+        return Submission::query()
+            ->orderByDesc('created_at')
+            ->get()
+            ->map(fn (Submission $submission) => [
+                'id' => $submission->submission_id,
+                'type' => $submission->type,
+                'payload' => $submission->payload ?? [],
+                'created_at' => optional($submission->created_at)->toDateTimeString(),
+            ])
+            ->all();
+    }
 
-        $raw = File::get($this->path);
-        $data = json_decode($raw, true);
+    private function generateId(string $type): string
+    {
+        $prefixes = [
+            'contact' => 'CON',
+            'cancellation' => 'RES',
+            'claim' => 'REC',
+            'signup' => 'SIGN',
+            'kbis_request' => 'KBIS',
+            'payment' => 'PAY',
+        ];
 
-        return is_array($data) ? $data : [];
+        $prefix = $prefixes[$type] ?? 'SUB';
+        $random = random_int(100000, 999999);
+
+        return $prefix.'-'.$random;
     }
 }
