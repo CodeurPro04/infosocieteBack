@@ -7,13 +7,17 @@ use App\Models\Claim;
 use App\Models\Contact;
 use App\Models\KbisRequest;
 use App\Models\Payment;
+use App\Services\StripeService;
 use App\Models\UserCustomer;
 use App\Services\SubmissionStore;
 use Illuminate\Http\Request;
 
 class FormController extends Controller
 {
-    public function __construct(private SubmissionStore $store)
+    public function __construct(
+        private SubmissionStore $store,
+        private StripeService $stripe
+    )
     {
     }
 
@@ -41,10 +45,27 @@ class FormController extends Controller
             'source_path' => 'nullable|string|max:255',
         ]);
 
-        Cancellation::create($payload);
-        $this->store->append('cancellation', $payload);
+        $stripeResult = $this->cancelStripeSubscriptionsByEmail($payload['email']);
 
-        return response()->json(['status' => 'received']);
+        $cancellation = Cancellation::create([
+            ...$payload,
+            'stripe_status' => $stripeResult['status'],
+            'stripe_cancelled_count' => $stripeResult['cancelled_count'],
+            'stripe_details' => $stripeResult,
+        ]);
+
+        $this->store->append('cancellation', [
+            ...$payload,
+            'stripe_status' => $stripeResult['status'],
+            'stripe_cancelled_count' => $stripeResult['cancelled_count'],
+            'cancellation_id' => $cancellation->id,
+        ]);
+
+        return response()->json([
+            'status' => 'received',
+            'stripe_status' => $stripeResult['status'],
+            'cancelled_count' => $stripeResult['cancelled_count'],
+        ]);
     }
 
     public function claim(Request $request)
@@ -230,6 +251,19 @@ class FormController extends Controller
             ],
         ];
 
+        $subscriptionData = [];
+        if (!empty($payload['stripe_intent_id'])) {
+            $subscriptionData = $this->createRecurringSubscriptionFromIntent($payload);
+            $paymentData['metadata'] = array_merge(
+                $paymentData['metadata'],
+                array_filter($subscriptionData, fn ($value) => $value !== null && $value !== '')
+            );
+
+            if (empty($subscriptionData['subscription_id'])) {
+                $paymentData['status'] = 'succeeded_without_subscription';
+            }
+        }
+
         if (!empty($payload['stripe_intent_id'])) {
             Payment::updateOrCreate(
                 ['stripe_intent_id' => $payload['stripe_intent_id']],
@@ -239,9 +273,186 @@ class FormController extends Controller
             Payment::create($paymentData);
         }
 
-        $this->store->append('payment', $payload);
+        $this->store->append('payment', [
+            ...$payload,
+            'subscription_status' => $subscriptionData['subscription_status'] ?? null,
+            'subscription_id' => $subscriptionData['subscription_id'] ?? null,
+            'subscription_error' => $subscriptionData['subscription_error'] ?? null,
+        ]);
 
-        return response()->json(['status' => 'received']);
+        if (!empty($payload['stripe_intent_id']) && empty($subscriptionData['subscription_id'])) {
+            $reason = $subscriptionData['subscription_error'] ?? 'unknown_error';
+            return response()->json([
+                'message' => 'Paiement validé, mais abonnement 72h→49,99 €/mois non créé automatiquement.',
+                'subscription_error' => $reason,
+            ], 422);
+        }
+
+        return response()->json([
+            'status' => 'received',
+            'subscription_id' => $subscriptionData['subscription_id'] ?? null,
+            'subscription_status' => $subscriptionData['subscription_status'] ?? null,
+        ]);
+    }
+
+    private function createRecurringSubscriptionFromIntent(array $payload): array
+    {
+        if (empty($payload['stripe_intent_id'])) {
+            return [];
+        }
+
+        try {
+            $intent = $this->stripe->client()->paymentIntents->retrieve(
+                $payload['stripe_intent_id'],
+                ['expand' => ['payment_method', 'customer']]
+            );
+        } catch (\Throwable $e) {
+            return ['subscription_error' => 'intent_fetch_failed: '.$e->getMessage()];
+        }
+
+        if (($intent->status ?? '') !== 'succeeded') {
+            return ['subscription_error' => 'intent_not_succeeded'];
+        }
+
+        $customerId = $intent->customer?->id ?? null;
+        $paymentMethodId = $intent->payment_method?->id ?? null;
+
+        try {
+            if (!$customerId) {
+                $createdCustomer = $this->stripe->client()->customers->create([
+                    'email' => $payload['email'] ?? null,
+                    'name' => $payload['holder_name'] ?? null,
+                    'metadata' => [
+                        'siret_or_siren' => $payload['siret_or_siren'] ?? '',
+                    ],
+                ]);
+                $customerId = $createdCustomer->id;
+            }
+
+            if ($paymentMethodId) {
+                try {
+                    $this->stripe->client()->paymentMethods->attach($paymentMethodId, [
+                        'customer' => $customerId,
+                    ]);
+                } catch (\Throwable $e) {
+                    $alreadyAttached = str_contains(mb_strtolower($e->getMessage()), 'already attached');
+                    if (!$alreadyAttached) {
+                        throw $e;
+                    }
+                }
+                $this->stripe->client()->customers->update($customerId, [
+                    'invoice_settings' => [
+                        'default_payment_method' => $paymentMethodId,
+                    ],
+                ]);
+            }
+        } catch (\Throwable $e) {
+            return ['subscription_error' => 'customer_or_pm_failed: '.$e->getMessage()];
+        }
+
+        $priceId = $this->resolveRecurringPriceId();
+        if (!$priceId) {
+            return ['subscription_error' => 'price_not_available'];
+        }
+
+        try {
+            $existing = $this->stripe->client()->subscriptions->all([
+                'customer' => $customerId,
+                'status' => 'all',
+                'limit' => 20,
+            ]);
+            foreach ($existing->data as $subscription) {
+                $subStatus = $subscription->status ?? '';
+                if (!in_array($subStatus, ['active', 'trialing', 'past_due', 'incomplete'], true)) {
+                    continue;
+                }
+                foreach (($subscription->items->data ?? []) as $item) {
+                    if (($item->price->id ?? null) === $priceId) {
+                        return [
+                            'stripe_customer_id' => $customerId,
+                            'subscription_id' => $subscription->id,
+                            'subscription_status' => $subscription->status,
+                            'subscription_trial_end' => $subscription->trial_end ?? null,
+                        ];
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            return ['subscription_error' => 'subscription_list_failed: '.$e->getMessage()];
+        }
+
+        $trialHours = max((int) config('stripe.trial_hours', 72), 1);
+        $trialEnd = now()->timestamp + ($trialHours * 3600);
+
+        try {
+            $subscription = $this->stripe->client()->subscriptions->create([
+                'customer' => $customerId,
+                'items' => [
+                    ['price' => $priceId],
+                ],
+                'trial_end' => $trialEnd,
+                'collection_method' => 'charge_automatically',
+                'default_payment_method' => $paymentMethodId,
+                'metadata' => [
+                    'siret_or_siren' => $payload['siret_or_siren'] ?? '',
+                    'email' => $payload['email'] ?? '',
+                    'source_path' => $payload['source_path'] ?? '/paiement',
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            return ['subscription_error' => 'subscription_create_failed: '.$e->getMessage()];
+        }
+
+        return [
+            'stripe_customer_id' => $customerId,
+            'subscription_id' => $subscription->id ?? null,
+            'subscription_status' => $subscription->status ?? null,
+            'subscription_trial_end' => $subscription->trial_end ?? null,
+        ];
+    }
+
+    private function resolveRecurringPriceId(): ?string
+    {
+        $configured = trim((string) config('stripe.recurring_price_id', ''));
+        if ($configured !== '') {
+            return $configured;
+        }
+
+        $currency = strtolower((string) config('stripe.currency', 'eur'));
+        $lookupKey = (string) config('stripe.recurring_lookup_key', 'infosociete-premium-4999-eur-monthly');
+        $amountCents = (int) round(((float) config('stripe.recurring_amount', 49.99)) * 100);
+        $productName = (string) config('stripe.recurring_product_name', 'Infosociete Premium Monthly');
+
+        try {
+            $prices = $this->stripe->client()->prices->all([
+                'lookup_keys' => [$lookupKey],
+                'active' => true,
+                'limit' => 1,
+            ]);
+            if (!empty($prices->data)) {
+                return $prices->data[0]->id;
+            }
+
+            $product = $this->stripe->client()->products->create([
+                'name' => $productName,
+                'metadata' => [
+                    'app' => 'infosociete',
+                    'type' => 'premium_subscription',
+                ],
+            ]);
+
+            $price = $this->stripe->client()->prices->create([
+                'product' => $product->id,
+                'unit_amount' => $amountCents,
+                'currency' => $currency,
+                'recurring' => ['interval' => 'month'],
+                'lookup_key' => $lookupKey,
+            ]);
+
+            return $price->id;
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     private function resolveCustomer(array $data): ?UserCustomer
@@ -266,5 +477,155 @@ class FormController extends Controller
         }
 
         return UserCustomer::create($data);
+    }
+
+    private function cancelStripeSubscriptionsByEmail(string $email): array
+    {
+        $normalizedEmail = mb_strtolower(trim($email));
+        $cancellableStatuses = ['active', 'trialing', 'past_due', 'unpaid', 'incomplete'];
+        $seenSubscriptions = [];
+        $seenCustomers = [];
+
+        $result = [
+            'status' => 'noop',
+            'email' => $normalizedEmail,
+            'customers' => [],
+            'cancelled_subscription_ids' => [],
+            'scheduled_subscription_ids' => [],
+            'already_closed_subscription_ids' => [],
+            'failed_subscription_ids' => [],
+            'errors' => [],
+            'cancelled_count' => 0,
+        ];
+
+        if (!config('stripe.secret')) {
+            $result['status'] = 'stripe_not_configured';
+            return $result;
+        }
+
+        // 1) First fallback from our local payments table (most reliable when Stripe customer email is missing)
+        $payments = Payment::query()
+            ->whereRaw('LOWER(email) = ?', [$normalizedEmail])
+            ->latest()
+            ->limit(50)
+            ->get();
+
+        foreach ($payments as $payment) {
+            $metadata = is_array($payment->metadata ?? null) ? $payment->metadata : [];
+            $subscriptionId = $metadata['subscription_id'] ?? null;
+            $customerId = $metadata['stripe_customer_id'] ?? null;
+
+            if ($customerId && !in_array($customerId, $seenCustomers, true)) {
+                $seenCustomers[] = $customerId;
+                $result['customers'][] = $customerId;
+            }
+
+            if ($subscriptionId && !in_array($subscriptionId, $seenSubscriptions, true)) {
+                $seenSubscriptions[] = $subscriptionId;
+                try {
+                    $subscription = $this->stripe->client()->subscriptions->retrieve($subscriptionId, []);
+                    $status = $subscription->status ?? null;
+
+                    if (!$status || !in_array($status, $cancellableStatuses, true)) {
+                        $result['already_closed_subscription_ids'][] = $subscriptionId;
+                        continue;
+                    }
+
+                    if (!empty($subscription->cancel_at_period_end)) {
+                        $result['scheduled_subscription_ids'][] = $subscriptionId;
+                        continue;
+                    }
+
+                    $this->stripe->client()->subscriptions->update($subscriptionId, [
+                        'cancel_at_period_end' => true,
+                    ]);
+                    $result['scheduled_subscription_ids'][] = $subscriptionId;
+                } catch (\Throwable $e) {
+                    $result['failed_subscription_ids'][] = $subscriptionId;
+                    $result['errors'][] = "subscription_cancel_failed:{$subscriptionId}:".$e->getMessage();
+                }
+            }
+        }
+
+        // 2) Then scan Stripe customers by email and cancel remaining subscriptions
+        try {
+            $customers = $this->stripe->client()->customers->all([
+                'email' => $normalizedEmail,
+                'limit' => 100,
+            ]);
+        } catch (\Throwable $e) {
+            $result['status'] = 'stripe_customer_fetch_failed';
+            $result['errors'][] = $e->getMessage();
+            return $result;
+        }
+
+        foreach (($customers->data ?? []) as $customer) {
+            $customerId = $customer->id ?? null;
+            if (!$customerId) {
+                continue;
+            }
+
+            if (!in_array($customerId, $seenCustomers, true)) {
+                $seenCustomers[] = $customerId;
+                $result['customers'][] = $customerId;
+            }
+
+            try {
+                $subscriptions = $this->stripe->client()->subscriptions->all([
+                    'customer' => $customerId,
+                    'status' => 'all',
+                    'limit' => 100,
+                ]);
+            } catch (\Throwable $e) {
+                $result['errors'][] = "subscriptions_list_failed:{$customerId}:".$e->getMessage();
+                continue;
+            }
+
+            foreach (($subscriptions->data ?? []) as $subscription) {
+                $subscriptionId = $subscription->id ?? null;
+                $status = $subscription->status ?? null;
+                if (!$subscriptionId || !$status || in_array($subscriptionId, $seenSubscriptions, true)) {
+                    continue;
+                }
+
+                $seenSubscriptions[] = $subscriptionId;
+
+                if (!in_array($status, $cancellableStatuses, true)) {
+                    $result['already_closed_subscription_ids'][] = $subscriptionId;
+                    continue;
+                }
+
+                try {
+                    if (!empty($subscription->cancel_at_period_end)) {
+                        $result['scheduled_subscription_ids'][] = $subscriptionId;
+                        continue;
+                    }
+
+                    $this->stripe->client()->subscriptions->update($subscriptionId, [
+                        'cancel_at_period_end' => true,
+                    ]);
+                    $result['scheduled_subscription_ids'][] = $subscriptionId;
+                } catch (\Throwable $e) {
+                    $result['failed_subscription_ids'][] = $subscriptionId;
+                    $result['errors'][] = "subscription_cancel_failed:{$subscriptionId}:".$e->getMessage();
+                }
+            }
+        }
+
+        $result['cancelled_count'] = count($result['scheduled_subscription_ids']);
+
+        if ($result['cancelled_count'] > 0) {
+            $result['status'] = 'scheduled_cancellation';
+        } elseif (count($result['errors']) > 0) {
+            $result['status'] = 'partial_error';
+        } elseif (!empty($result['customers']) || !empty($seenSubscriptions)) {
+            $result['status'] = 'no_cancellable_subscription';
+        } elseif ($payments->isNotEmpty()) {
+            $result['status'] = 'no_subscription_linked';
+        } else {
+            $result['status'] = 'no_customer';
+        }
+
+        return $result;
     }
 }

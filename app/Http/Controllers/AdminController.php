@@ -93,7 +93,13 @@ class AdminController extends Controller
             $items[] = [
                 'id' => 'RES-'.$row->id,
                 'type' => 'cancellation',
-                'payload' => $row->only(['email', 'source_path']),
+                'payload' => $row->only([
+                    'email',
+                    'source_path',
+                    'stripe_status',
+                    'stripe_cancelled_count',
+                    'stripe_details',
+                ]),
                 'created_at' => optional($row->created_at)->toDateTimeString(),
             ];
         }

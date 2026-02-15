@@ -24,12 +24,36 @@ class PaymentController extends Controller
         ]);
 
         $currency = config('stripe.currency', 'eur');
+        $customerId = null;
+
+        if (!empty($payload['email'])) {
+            try {
+                $existingCustomers = $this->stripe->client()->customers->all([
+                    'email' => $payload['email'],
+                    'limit' => 1,
+                ]);
+                if (!empty($existingCustomers->data)) {
+                    $customerId = $existingCustomers->data[0]->id;
+                } else {
+                    $createdCustomer = $this->stripe->client()->customers->create([
+                        'email' => $payload['email'],
+                    ]);
+                    $customerId = $createdCustomer->id;
+                }
+            } catch (\Throwable $e) {
+                // Do not block intent creation if customer lookup fails.
+                $customerId = null;
+            }
+        }
+
         try {
             $intent = $this->stripe->client()->paymentIntents->create([
                 'amount' => (int) round($payload['amount'] * 100),
                 'currency' => $currency,
                 'receipt_email' => $payload['email'] ?? null,
                 'description' => $payload['description'] ?? 'Paiement Infosociete',
+                'customer' => $customerId,
+                'setup_future_usage' => 'off_session',
                 'metadata' => array_merge(
                     ['siret_or_siren' => $payload['siret_or_siren']],
                     $payload['metadata'] ?? []
@@ -51,7 +75,12 @@ class PaymentController extends Controller
                 'email' => $payload['email'] ?? null,
                 'siret_or_siren' => $payload['siret_or_siren'],
                 'source_path' => $payload['source_path'] ?? '/paiement',
-                'metadata' => $payload['metadata'] ?? null,
+                'metadata' => array_merge(
+                    $payload['metadata'] ?? [],
+                    array_filter([
+                        'stripe_customer_id' => $customerId,
+                    ], fn ($v) => !empty($v))
+                ),
             ]
         );
 
