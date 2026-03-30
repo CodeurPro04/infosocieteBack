@@ -1,9 +1,14 @@
 <?php
 
+$allowedOrigins = array_values(array_filter(array_map(
+    static fn (string $origin): string => trim($origin),
+    explode(',', (string) env('CORS_ALLOWED_ORIGINS', ''))
+)));
+
 return [
     'paths' => ['api/*'],
     'allowed_methods' => ['*'],
-    'allowed_origins' => [
+    'allowed_origins' => $allowedOrigins !== [] ? $allowedOrigins : [
         'http://localhost:5173',
         'http://127.0.0.1:5173',
         'http://localhost:5174',
