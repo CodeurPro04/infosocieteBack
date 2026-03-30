@@ -3,13 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Models\Payment;
+use App\Services\PaymentFulfillmentService;
 use App\Services\StripeService;
 use Illuminate\Http\Request;
 
 class PaymentController extends Controller
 {
     public function __construct(
-        private StripeService $stripe
+        private StripeService $stripe,
+        private PaymentFulfillmentService $fulfillment
     ) {
     }
 
@@ -110,14 +112,21 @@ class PaymentController extends Controller
         $data = $event->data->object ?? null;
 
         if ($data && !empty($data->id)) {
-            Payment::query()
-                ->where('stripe_intent_id', $data->id)
-                ->update([
+            $payment = Payment::query()->where('stripe_intent_id', $data->id)->first();
+
+            if ($payment) {
+                $metadata = is_array($payment->metadata ?? null) ? $payment->metadata : [];
+                $payment->update([
                     'status' => $data->status ?? $type,
-                    'metadata' => [
+                    'metadata' => array_merge($metadata, [
                         'webhook_event' => $type,
-                    ],
+                    ]),
                 ]);
+
+                if (($type === 'payment_intent.succeeded' || ($data->status ?? null) === 'succeeded')) {
+                    $this->fulfillment->fulfill($payment->fresh());
+                }
+            }
         }
 
         return response()->json(['received' => true]);
