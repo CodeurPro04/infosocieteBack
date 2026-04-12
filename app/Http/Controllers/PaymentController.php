@@ -60,7 +60,7 @@ class PaymentController extends Controller
                     ['siret_or_siren' => $payload['siret_or_siren']],
                     $payload['metadata'] ?? []
                 ),
-                'automatic_payment_methods' => ['enabled' => true],
+                'payment_method_types' => ['card'],
             ]);
         } catch (\Stripe\Exception\ApiErrorException $e) {
             return response()->json([
