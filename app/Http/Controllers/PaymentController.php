@@ -6,6 +6,7 @@ use App\Models\Payment;
 use App\Services\PaymentFulfillmentService;
 use App\Services\StripeService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 class PaymentController extends Controller
 {
@@ -110,25 +111,95 @@ class PaymentController extends Controller
 
         $type = $event->type ?? '';
         $data = $event->data->object ?? null;
+        $paymentIntentId = $this->resolvePaymentIntentId($data);
 
-        if ($data && !empty($data->id)) {
-            $payment = Payment::query()->where('stripe_intent_id', $data->id)->first();
-
-            if ($payment) {
-                $metadata = is_array($payment->metadata ?? null) ? $payment->metadata : [];
-                $payment->update([
-                    'status' => $data->status ?? $type,
-                    'metadata' => array_merge($metadata, [
-                        'webhook_event' => $type,
-                    ]),
+        app()->terminating(function () use ($type, $data, $paymentIntentId): void {
+            try {
+                $this->processWebhookEvent($type, $data, $paymentIntentId);
+            } catch (\Throwable $e) {
+                Log::error('stripe_webhook_processing_failed', [
+                    'event_type' => $type,
+                    'payment_intent_id' => $paymentIntentId,
+                    'error' => $e->getMessage(),
                 ]);
-
-                if (($type === 'payment_intent.succeeded' || ($data->status ?? null) === 'succeeded')) {
-                    $this->fulfillment->fulfill($payment->fresh());
-                }
             }
+        });
+
+        return response()->json(['received' => true], 200);
+    }
+
+    private function processWebhookEvent(string $type, mixed $data, ?string $paymentIntentId): void
+    {
+        if (!$data || !$paymentIntentId) {
+            Log::warning('stripe_webhook_payment_not_resolved', [
+                'event_type' => $type,
+                'payment_intent_id' => $paymentIntentId,
+            ]);
+            return;
         }
 
-        return response()->json(['received' => true]);
+        $payment = Payment::query()->where('stripe_intent_id', $paymentIntentId)->first();
+        if (!$payment) {
+            Log::warning('stripe_webhook_payment_not_found', [
+                'event_type' => $type,
+                'payment_intent_id' => $paymentIntentId,
+            ]);
+            return;
+        }
+
+        $metadata = is_array($payment->metadata ?? null) ? $payment->metadata : [];
+        $payment->update([
+            'status' => $data->status ?? $payment->status ?? $type,
+            'metadata' => array_merge($metadata, [
+                'webhook_event' => $type,
+                'webhook_received_at' => now()->toIso8601String(),
+            ]),
+        ]);
+
+        $objectType = is_object($data) ? (string) ($data->object ?? '') : '';
+        $shouldFulfill = $type === 'payment_intent.succeeded'
+            || ($objectType === 'payment_intent' && ($data->status ?? null) === 'succeeded');
+
+        if ($shouldFulfill) {
+            try {
+                $this->fulfillment->fulfill($payment->fresh());
+            } catch (\Throwable $e) {
+                Log::error('stripe_webhook_fulfillment_failed', [
+                    'payment_id' => $payment->id,
+                    'payment_intent_id' => $paymentIntentId,
+                    'event_type' => $type,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    private function resolvePaymentIntentId(mixed $data): ?string
+    {
+        if (!$data || !is_object($data)) {
+            return null;
+        }
+
+        $objectType = (string) ($data->object ?? '');
+        $id = (string) ($data->id ?? '');
+        $paymentIntent = $data->payment_intent ?? null;
+
+        if ($objectType === 'payment_intent' && $id !== '') {
+            return $id;
+        }
+
+        if (is_string($paymentIntent) && $paymentIntent !== '') {
+            return $paymentIntent;
+        }
+
+        if (is_object($paymentIntent) && !empty($paymentIntent->id)) {
+            return (string) $paymentIntent->id;
+        }
+
+        if (str_starts_with($id, 'pi_')) {
+            return $id;
+        }
+
+        return null;
     }
 }
