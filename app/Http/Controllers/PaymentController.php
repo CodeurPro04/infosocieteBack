@@ -92,7 +92,6 @@ class PaymentController extends Controller
                             ],
                         ],
                         'quantity' => 1,
-                        'description' => $payload['description'] ?? 'Essai 72h',
                     ],
                 ],
                 'metadata' => array_merge(
