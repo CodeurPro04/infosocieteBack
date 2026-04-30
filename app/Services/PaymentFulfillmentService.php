@@ -10,7 +10,8 @@ use Illuminate\Support\Facades\Mail;
 class PaymentFulfillmentService
 {
     public function __construct(
-        private StripeService $stripe
+        private StripeService $stripe,
+        private StripeRecurringPriceResolver $recurringPriceResolver
     ) {
     }
 
@@ -22,11 +23,16 @@ class PaymentFulfillmentService
             'subscription_status' => $metadata['subscription_status'] ?? null,
             'subscription_trial_end' => $metadata['subscription_trial_end'] ?? null,
             'subscription_error' => null,
+            'invoice_id' => $metadata['invoice_id'] ?? null,
+            'hosted_invoice_url' => $metadata['hosted_invoice_url'] ?? null,
+            'invoice_pdf' => $metadata['invoice_pdf'] ?? null,
+            'receipt_url' => $metadata['receipt_url'] ?? null,
             'confirmation_email_sent' => !empty($metadata['confirmation_email_sent_at']),
             'confirmation_email_error' => null,
         ];
 
         if (!empty($payment->stripe_intent_id)) {
+            $this->ensureInvoiceLinks($payment);
             $subscriptionResult = $this->ensureSubscription($payment);
             $result = array_merge($result, $subscriptionResult);
             $payment->refresh();
@@ -53,7 +59,7 @@ class PaymentFulfillmentService
         try {
             $intent = $this->stripe->client()->paymentIntents->retrieve(
                 $payment->stripe_intent_id,
-                ['expand' => ['payment_method', 'customer']]
+                ['expand' => ['payment_method', 'customer', 'invoice.subscription']]
             );
         } catch (\Throwable $e) {
             $error = 'intent_fetch_failed: '.$e->getMessage();
@@ -69,6 +75,19 @@ class PaymentFulfillmentService
 
         $customerId = $intent->customer?->id ?? ($metadata['stripe_customer_id'] ?? null);
         $paymentMethodId = $intent->payment_method?->id ?? null;
+        $subscriptionFromInvoice = $intent->invoice?->subscription ?? null;
+
+        if (is_object($subscriptionFromInvoice) && !empty($subscriptionFromInvoice->id)) {
+            $payload = [
+                'stripe_customer_id' => $customerId,
+                'subscription_id' => (string) $subscriptionFromInvoice->id,
+                'subscription_status' => $subscriptionFromInvoice->status ?? null,
+                'subscription_trial_end' => $subscriptionFromInvoice->trial_end ?? null,
+                'subscription_error' => null,
+            ];
+            $this->updatePaymentMetadata($payment, $payload, 'succeeded');
+            return $payload;
+        }
 
         try {
             if (!$customerId) {
@@ -106,7 +125,7 @@ class PaymentFulfillmentService
             return ['subscription_error' => $error];
         }
 
-        $priceId = $this->resolveRecurringPriceId();
+        $priceId = $this->recurringPriceResolver->resolve();
         if (!$priceId) {
             $error = 'price_not_available';
             $this->updatePaymentMetadata($payment, ['subscription_error' => $error]);
@@ -180,6 +199,40 @@ class PaymentFulfillmentService
         return $payload;
     }
 
+    private function ensureInvoiceLinks(Payment $payment): void
+    {
+        $metadata = $this->metadata($payment);
+        if (!empty($metadata['invoice_id']) || !empty($metadata['receipt_url'])) {
+            return;
+        }
+
+        try {
+            $intent = $this->stripe->client()->paymentIntents->retrieve(
+                $payment->stripe_intent_id,
+                ['expand' => ['invoice', 'charges.data']]
+            );
+        } catch (\Throwable) {
+            return;
+        }
+
+        $updates = [];
+
+        if (!empty($intent->invoice)) {
+            $updates['invoice_id'] = (string) ($intent->invoice->id ?? '');
+            $updates['hosted_invoice_url'] = (string) ($intent->invoice->hosted_invoice_url ?? '');
+            $updates['invoice_pdf'] = (string) ($intent->invoice->invoice_pdf ?? '');
+        }
+
+        $charge = $intent->charges->data[0] ?? null;
+        if ($charge && !empty($charge->receipt_url)) {
+            $updates['receipt_url'] = (string) $charge->receipt_url;
+        }
+
+        if ($updates !== []) {
+            $this->updatePaymentMetadata($payment, $updates);
+        }
+    }
+
     private function sendConfirmationEmail(Payment $payment): array
     {
         $metadata = $this->metadata($payment);
@@ -220,51 +273,6 @@ class PaymentFulfillmentService
         ]);
 
         return ['confirmation_email_sent' => true, 'confirmation_email_error' => null];
-    }
-
-    private function resolveRecurringPriceId(): ?string
-    {
-        $configured = trim((string) config('stripe.recurring_price_id', ''));
-        if ($configured !== '') {
-            return $configured;
-        }
-
-        $currency = strtolower((string) config('stripe.currency', 'eur'));
-        $lookupKey = (string) config('stripe.recurring_lookup_key', 'infosociete-premium-4999-eur-monthly');
-        $amountCents = (int) round(((float) config('stripe.recurring_amount', 49.99)) * 100);
-        $productName = (string) config('stripe.recurring_product_name', 'Infosociete Premium Monthly');
-
-        try {
-            $prices = $this->stripe->client()->prices->all([
-                'lookup_keys' => [$lookupKey],
-                'active' => true,
-                'limit' => 1,
-            ]);
-            if (!empty($prices->data)) {
-                return $prices->data[0]->id;
-            }
-
-            $product = $this->stripe->client()->products->create([
-                'name' => $productName,
-                'metadata' => [
-                    'app' => 'infosociete',
-                    'type' => 'premium_subscription',
-                ],
-            ]);
-
-            $price = $this->stripe->client()->prices->create([
-                'product' => $product->id,
-                'unit_amount' => $amountCents,
-                'currency' => $currency,
-                'recurring' => ['interval' => 'month'],
-                'lookup_key' => $lookupKey,
-            ]);
-
-            return $price->id;
-        } catch (\Throwable $e) {
-            Log::error('stripe_resolve_recurring_price_failed', ['error' => $e->getMessage()]);
-            return null;
-        }
     }
 
     private function updatePaymentMetadata(Payment $payment, array $extra, ?string $status = null): void

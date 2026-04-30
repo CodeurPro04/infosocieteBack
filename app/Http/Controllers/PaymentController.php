@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Payment;
 use App\Services\PaymentFulfillmentService;
 use App\Services\StripeService;
+use App\Services\StripeRecurringPriceResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -12,7 +13,8 @@ class PaymentController extends Controller
 {
     public function __construct(
         private StripeService $stripe,
-        private PaymentFulfillmentService $fulfillment
+        private PaymentFulfillmentService $fulfillment,
+        private StripeRecurringPriceResolver $recurringPriceResolver
     ) {
     }
 
@@ -50,19 +52,60 @@ class PaymentController extends Controller
         }
 
         try {
-            $intent = $this->stripe->client()->paymentIntents->create([
-                'amount' => (int) round($payload['amount'] * 100),
-                'currency' => $currency,
-                'receipt_email' => $payload['email'] ?? null,
-                'description' => $payload['description'] ?? 'Paiement Infosociete',
+            $priceId = $this->recurringPriceResolver->resolve();
+            if (!$priceId) {
+                return response()->json(['message' => 'Stripe price not configured'], 422);
+            }
+
+            if (!$customerId) {
+                $customer = $this->stripe->client()->customers->create([
+                    'email' => $payload['email'] ?? null,
+                    'metadata' => [
+                        'siret_or_siren' => (string) $payload['siret_or_siren'],
+                    ],
+                ]);
+                $customerId = $customer->id;
+            }
+
+            $trialHours = max((int) config('stripe.trial_hours', 72), 1);
+            $trialEnd = now()->timestamp + ($trialHours * 3600);
+            $trialFeeCents = (int) round(((float) $payload['amount']) * 100);
+
+            $subscription = $this->stripe->client()->subscriptions->create([
                 'customer' => $customerId,
-                'setup_future_usage' => 'off_session',
+                'items' => [
+                    ['price' => $priceId],
+                ],
+                'trial_end' => $trialEnd,
+                'collection_method' => 'charge_automatically',
+                'payment_behavior' => 'default_incomplete',
+                'payment_settings' => [
+                    'save_default_payment_method' => 'on_subscription',
+                ],
+                'add_invoice_items' => [
+                    [
+                        'price_data' => [
+                            'currency' => $currency,
+                            'unit_amount' => $trialFeeCents,
+                            'product_data' => [
+                                'name' => 'Essai 72h DOCSFLOW',
+                            ],
+                        ],
+                        'quantity' => 1,
+                        'description' => $payload['description'] ?? 'Essai 72h',
+                    ],
+                ],
                 'metadata' => array_merge(
                     ['siret_or_siren' => $payload['siret_or_siren']],
                     $payload['metadata'] ?? []
                 ),
-                'payment_method_types' => ['card'],
+                'expand' => ['latest_invoice.payment_intent'],
             ]);
+
+            $intent = $subscription->latest_invoice?->payment_intent ?? null;
+            if (!$intent || empty($intent->client_secret) || empty($intent->id)) {
+                return response()->json(['message' => 'Stripe subscription payment intent missing'], 422);
+            }
         } catch (\Stripe\Exception\ApiErrorException $e) {
             return response()->json([
                 'message' => $e->getMessage(),
@@ -72,7 +115,7 @@ class PaymentController extends Controller
         Payment::updateOrCreate(
             ['stripe_intent_id' => $intent->id],
             [
-                'status' => $intent->status,
+                'status' => $intent->status ?? 'requires_payment_method',
                 'amount' => $payload['amount'],
                 'currency' => $currency,
                 'email' => $payload['email'] ?? null,
@@ -82,6 +125,9 @@ class PaymentController extends Controller
                     $payload['metadata'] ?? [],
                     array_filter([
                         'stripe_customer_id' => $customerId,
+                        'subscription_id' => $subscription->id ?? null,
+                        'subscription_status' => $subscription->status ?? null,
+                        'subscription_trial_end' => $subscription->trial_end ?? null,
                     ], fn ($v) => !empty($v))
                 ),
             ]
@@ -100,12 +146,23 @@ class PaymentController extends Controller
         $payload = $request->getContent();
 
         if (!$secret || !$signature) {
+            Log::error('stripe_webhook_missing_configuration', [
+                'has_secret' => (bool) $secret,
+                'has_signature' => (bool) $signature,
+                'ip' => $request->ip(),
+                'user_agent' => $request->userAgent(),
+            ]);
             return response()->json(['message' => 'Missing webhook configuration'], 400);
         }
 
         try {
             $event = \Stripe\Webhook::constructEvent($payload, $signature, $secret);
         } catch (\Throwable $e) {
+            Log::error('stripe_webhook_invalid_signature', [
+                'ip' => $request->ip(),
+                'user_agent' => $request->userAgent(),
+                'error' => $e->getMessage(),
+            ]);
             return response()->json(['message' => 'Invalid signature'], 400);
         }
 
@@ -158,7 +215,10 @@ class PaymentController extends Controller
 
         $objectType = is_object($data) ? (string) ($data->object ?? '') : '';
         $shouldFulfill = $type === 'payment_intent.succeeded'
-            || ($objectType === 'payment_intent' && ($data->status ?? null) === 'succeeded');
+            || $type === 'invoice.payment_succeeded'
+            || $type === 'invoice.paid'
+            || ($objectType === 'payment_intent' && ($data->status ?? null) === 'succeeded')
+            || ($objectType === 'invoice' && (bool) ($data->paid ?? false) === true);
 
         if ($shouldFulfill) {
             try {

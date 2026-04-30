@@ -80,6 +80,20 @@
 
                     <tr>
                         <td style="padding:28px 36px 36px;">
+                            @if (!empty($hostedInvoiceUrl) || !empty($invoicePdf) || !empty($receiptUrl))
+                                <div style="margin:0 0 18px; padding:18px 20px; border-radius:16px; background-color:#eef6ff; border:1px solid #bfdbfe;">
+                                    <div style="font-size:14px; font-weight:700; color:#1e3a8a;">Votre facture</div>
+                                    <p style="margin:8px 0 0; font-size:14px; line-height:1.7; color:#1f2937;">
+                                        @if (!empty($hostedInvoiceUrl))
+                                            <a href="{{ $hostedInvoiceUrl }}" style="color:#0f766e; text-decoration:none; font-weight:700;">Voir la facture en ligne</a>
+                                        @elseif (!empty($invoicePdf))
+                                            <a href="{{ $invoicePdf }}" style="color:#0f766e; text-decoration:none; font-weight:700;">Télécharger la facture (PDF)</a>
+                                        @elseif (!empty($receiptUrl))
+                                            <a href="{{ $receiptUrl }}" style="color:#0f766e; text-decoration:none; font-weight:700;">Voir le reçu Stripe</a>
+                                        @endif
+                                    </p>
+                                </div>
+                            @endif
                             <p style="margin:0; font-size:15px; line-height:1.8; color:#334155;">
                                 Si vous avez besoin d’aide ou souhaitez nous contacter, notre équipe reste disponible à l’adresse
                                 <a href="mailto:{{ $supportEmail }}" style="color:#0f766e; text-decoration:none; font-weight:700;">{{ $supportEmail }}</a>.

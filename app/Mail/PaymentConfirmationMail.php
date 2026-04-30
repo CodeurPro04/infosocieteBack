@@ -45,6 +45,9 @@ class PaymentConfirmationMail extends Mailable
                 'supportEmail' => (string) config('mail.from.address', 'Contact@docsflow.fr'),
                 'monthlyAmount' => $this->formatAmount((float) config('stripe.recurring_amount', 49.99)),
                 'orderReference' => $this->payment->stripe_intent_id ?: 'Commande #'.$this->payment->id,
+                'hostedInvoiceUrl' => (string) ($metadata['hosted_invoice_url'] ?? ''),
+                'invoicePdf' => (string) ($metadata['invoice_pdf'] ?? ''),
+                'receiptUrl' => (string) ($metadata['receipt_url'] ?? ''),
             ]
         );
     }
