@@ -6,6 +6,7 @@ use App\Models\Payment;
 use App\Services\PaymentFulfillmentService;
 use App\Services\StripeService;
 use App\Services\StripeRecurringPriceResolver;
+use App\Services\StripeTrialFeePriceResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -14,7 +15,8 @@ class PaymentController extends Controller
     public function __construct(
         private StripeService $stripe,
         private PaymentFulfillmentService $fulfillment,
-        private StripeRecurringPriceResolver $recurringPriceResolver
+        private StripeRecurringPriceResolver $recurringPriceResolver,
+        private StripeTrialFeePriceResolver $trialFeePriceResolver
     ) {
     }
 
@@ -57,6 +59,16 @@ class PaymentController extends Controller
                 return response()->json(['message' => 'Stripe price not configured'], 422);
             }
 
+            $trialFeePriceId = $this->trialFeePriceResolver->resolve();
+            if (!$trialFeePriceId) {
+                return response()->json(['message' => 'Stripe trial fee price not configured'], 422);
+            }
+
+            $expectedTrialFee = (float) config('stripe.trial_fee_amount', 1.49);
+            if (abs(((float) $payload['amount']) - $expectedTrialFee) > 0.001) {
+                return response()->json(['message' => 'Invalid trial fee amount'], 422);
+            }
+
             if (!$customerId) {
                 $customer = $this->stripe->client()->customers->create([
                     'email' => $payload['email'] ?? null,
@@ -69,7 +81,6 @@ class PaymentController extends Controller
 
             $trialHours = max((int) config('stripe.trial_hours', 72), 1);
             $trialEnd = now()->timestamp + ($trialHours * 3600);
-            $trialFeeCents = (int) round(((float) $payload['amount']) * 100);
 
             $subscription = $this->stripe->client()->subscriptions->create([
                 'customer' => $customerId,
@@ -84,13 +95,7 @@ class PaymentController extends Controller
                 ],
                 'add_invoice_items' => [
                     [
-                        'price_data' => [
-                            'currency' => $currency,
-                            'unit_amount' => $trialFeeCents,
-                            'product_data' => [
-                                'name' => 'Essai 72h DOCSFLOW',
-                            ],
-                        ],
+                        'price' => $trialFeePriceId,
                         'quantity' => 1,
                     ],
                 ],
