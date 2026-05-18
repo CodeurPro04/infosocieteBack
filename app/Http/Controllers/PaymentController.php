@@ -5,8 +5,6 @@ namespace App\Http\Controllers;
 use App\Models\Payment;
 use App\Services\PaymentFulfillmentService;
 use App\Services\StripeService;
-use App\Services\StripeRecurringPriceResolver;
-use App\Services\StripeTrialFeePriceResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -14,9 +12,7 @@ class PaymentController extends Controller
 {
     public function __construct(
         private StripeService $stripe,
-        private PaymentFulfillmentService $fulfillment,
-        private StripeRecurringPriceResolver $recurringPriceResolver,
-        private StripeTrialFeePriceResolver $trialFeePriceResolver
+        private PaymentFulfillmentService $fulfillment
     ) {
     }
 
@@ -54,62 +50,53 @@ class PaymentController extends Controller
         }
 
         try {
-            $priceId = $this->recurringPriceResolver->resolve();
-            if (!$priceId) {
-                return response()->json(['message' => 'Stripe price not configured'], 422);
-            }
-
-            $trialFeePriceId = $this->trialFeePriceResolver->resolve();
-            if (!$trialFeePriceId) {
-                return response()->json(['message' => 'Stripe trial fee price not configured'], 422);
-            }
-
             $expectedTrialFee = (float) config('stripe.trial_fee_amount', 1.49);
             if (abs(((float) $payload['amount']) - $expectedTrialFee) > 0.001) {
                 return response()->json(['message' => 'Invalid trial fee amount'], 422);
             }
 
-            if (!$customerId) {
-                $customer = $this->stripe->client()->customers->create([
-                    'email' => $payload['email'] ?? null,
-                    'metadata' => [
-                        'siret_or_siren' => (string) $payload['siret_or_siren'],
-                    ],
-                ]);
-                $customerId = $customer->id;
-            }
+            $amountCents = (int) round(((float) $payload['amount']) * 100);
+            $description = $payload['description'] ?? (string) config('stripe.trial_fee_product_name', 'Accès essai 72h DOCSFLOW');
+            $itemMetadata = array_merge(
+                ['siret_or_siren' => $payload['siret_or_siren']],
+                $payload['metadata'] ?? []
+            );
 
-            $trialHours = max((int) config('stripe.trial_hours', 72), 1);
-            $trialEnd = now()->timestamp + ($trialHours * 3600);
-
-            $subscription = $this->stripe->client()->subscriptions->create([
+            // Create a draft invoice first so the item is scoped to it
+            $invoice = $this->stripe->client()->invoices->create([
                 'customer' => $customerId,
-                'items' => [
-                    ['price' => $priceId],
-                ],
-                'trial_end' => $trialEnd,
                 'collection_method' => 'charge_automatically',
-                'payment_behavior' => 'default_incomplete',
-                'payment_settings' => [
-                    'save_default_payment_method' => 'on_subscription',
-                ],
-                'add_invoice_items' => [
-                    [
-                        'price' => $trialFeePriceId,
-                        'quantity' => 1,
-                    ],
-                ],
-                'metadata' => array_merge(
-                    ['siret_or_siren' => $payload['siret_or_siren']],
-                    $payload['metadata'] ?? []
-                ),
-                'expand' => ['latest_invoice.payment_intent'],
+                'auto_advance' => false,
+                'metadata' => ['siret_or_siren' => $payload['siret_or_siren']],
             ]);
 
-            $intent = $subscription->latest_invoice?->payment_intent ?? null;
-            if (!$intent || empty($intent->client_secret) || empty($intent->id)) {
-                return response()->json(['message' => 'Stripe subscription payment intent missing'], 422);
-            }
+            // Attach the trial-fee line item to this invoice
+            $this->stripe->client()->invoiceItems->create([
+                'customer' => $customerId,
+                'invoice' => $invoice->id,
+                'amount' => $amountCents,
+                'currency' => $currency,
+                'description' => $description,
+                'metadata' => $itemMetadata,
+            ]);
+
+            // Finalize to generate the PaymentIntent
+            $invoice = $this->stripe->client()->invoices->finalizeInvoice(
+                $invoice->id,
+                ['expand' => ['payment_intent']]
+            );
+
+            $piId = is_object($invoice->payment_intent)
+                ? $invoice->payment_intent->id
+                : (string) $invoice->payment_intent;
+
+            // Save payment method for future subscription charges
+            $this->stripe->client()->paymentIntents->update($piId, [
+                'setup_future_usage' => 'off_session',
+                'receipt_email' => $payload['email'] ?? null,
+            ]);
+
+            $intent = $this->stripe->client()->paymentIntents->retrieve($piId);
         } catch (\Stripe\Exception\ApiErrorException $e) {
             return response()->json([
                 'message' => $e->getMessage(),
@@ -129,9 +116,7 @@ class PaymentController extends Controller
                     $payload['metadata'] ?? [],
                     array_filter([
                         'stripe_customer_id' => $customerId,
-                        'subscription_id' => $subscription->id ?? null,
-                        'subscription_status' => $subscription->status ?? null,
-                        'subscription_trial_end' => $subscription->trial_end ?? null,
+                        'stripe_invoice_id' => $invoice->id,
                     ], fn ($v) => !empty($v))
                 ),
             ]

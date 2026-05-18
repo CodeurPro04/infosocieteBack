@@ -171,7 +171,8 @@ class PaymentFulfillmentService
                 'items' => [
                     ['price' => $priceId],
                 ],
-                'trial_end' => $trialEnd,
+                'billing_cycle_anchor' => $trialEnd,
+                'proration_behavior' => 'none',
                 'collection_method' => 'charge_automatically',
                 'default_payment_method' => $paymentMethodId,
                 'metadata' => [
@@ -190,7 +191,7 @@ class PaymentFulfillmentService
             'stripe_customer_id' => $customerId,
             'subscription_id' => $subscription->id ?? null,
             'subscription_status' => $subscription->status ?? null,
-            'subscription_trial_end' => $subscription->trial_end ?? null,
+            'subscription_trial_end' => $trialEnd,
             'subscription_error' => null,
         ];
 
